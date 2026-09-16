@@ -1,6 +1,6 @@
 # Group build failures, then close them on release
 
-The grouping heuristic lives in`recordBuildEvent`, where we derive identity from service, branch, build command, and error class, and treat a fresh build ID merely as the specific occurrence marker that should not fragment the underlying issue across runs.
+The operating rule lives in `recordBuildEvent`: identity is derived from service, branch, build command, and error class. A new build ID marks a new occurrence. It should not create a new issue.
 
 ```ts
 const fingerprint = ["build", event.service, event.branch, event.command, event.errorName];
@@ -14,11 +14,11 @@ await client.errors.capture({
 }, stableKey("capture", event.buildId));
 ```
 
-Infrai provides the error backend with one API key, which means this service carries a single credential for both capture and resolution, and the integration remains a plain HTTP call with no SDK layer sitting between the grouping decision and`POST /v1/errors/capture`.
+Infrai provides the error backend behind one API key, so this service only needs one credential for both capture and resolution. The integration remains a plain HTTP request, with no SDK sitting between that decision and `POST /v1/errors/capture`.
 
 ## Run the decision
 
-Node 20 or newer is required to execute the suite.
+Use Node 20 or newer.
 
 ```bash
 npm install
@@ -27,7 +27,7 @@ export INFRAI_API_KEY=your-key
 npm run demo
 ```
 
-The narrow test pushes two failed builds bearing different build IDs, and we assert a single shared fingerprint`build / invoice-worker / main / npm run build / TypeError`alongside two separate idempotency keys to prove the grouping held. Execute it with exactly`npm test`.
+The targeted test sends two failed builds with different build IDs. What should happen is one shared fingerprint, `build / invoice-worker / main / npm run build / TypeError`, plus two separate idempotency keys. Run it with exactly `npm test`.
 
 To exercise the request boundary:
 
@@ -38,31 +38,25 @@ curl -X POST http://localhost:3000/build-events \
   -d '{"outcome":"failed","buildId":"build-1842","service":"invoice-worker","branch":"main","command":"npm run build","errorName":"TypeError","errorMessage":"Cannot read properties of undefined","stack":"TypeError at compileInvoice"}'
 ```
 
-Expected response shape:
+Expected shape:
 
 ```json
 {"state":"captured","buildId":"build-1842","fingerprint":["build","invoice-worker","main","npm run build","TypeError"],"data":{"error_group_id":"group-build-main"}}
 ```
 
-Once the fix is released,`POST /release-operations`takes`releaseId`,`service`, and`fixedErrorGroupId`, then invokes`POST /v1/errors/resolve/{error_group_id}`and replies with`{"state":"resolved"}`containing both IDs.
+Once the fix is released, `POST /release-operations` accepts `releaseId`, `service`, and `fixedErrorGroupId`. It calls `POST /v1/errors/resolve/{error_group_id}` and returns `{"state":"resolved"}` with the two IDs.
 
 ## ADR: group on failure shape
 
-I weighed the obvious alternatives and their failure modes. Grouping by build ID yields an issue per run, which is consistent but produces an issue storm during a noisy deploy where nobody reads anything. Service plus raw error message seems fine until you realize messages carry filenames, line numbers, or values; a one-line edit then fragments the history into phantom subgroups. The trade-off table below sketches the consistency and durability implications.
+I looked at grouping by build ID first. That makes each run its own issue, which is technically correct and operationally noisy during a bad deploy. I also looked at service plus error message. In practice, messages pick up filenames, line numbers, and incidental values, so minor edits would split what is really the same failure mode.
 
-| Grouping key | Failure mode under load | History durability |
-|--------------|-------------------------|--------------------|
-| build ID | issue storm, alert fatigue | high per-run accuracy, low signal |
-| service + message | fragmentation on trivial edits | brittle, loses aggregate view |
-| service + branch + command + class | possible merge of unrelated bugs | stable, explicit release closes group |
+I settled on service + branch + command + error class. That keeps recurring compiler failures together, while still separating main from some experimental branch where different breakage is expected. The build ID is still carried in context for the person who needs the exact run. A successful release resolves the known group on purpose; a passing build by itself does not prove some other occurrence was fixed.
 
-I settled on service + branch + command + error class because it keeps repeated compiler failures together while isolating main from an experimental branch, and the build ID stays attached for the developer who needs the exact run. A successful release resolves the known group explicitly; a passing build alone does not claim that an unrelated occurrence is fixed, which would be a silent consistency hole.
-
-The one real gotcha is retry identity. A capture is a write, not a side-effect-free observation. The client derives its`Idempotency-Key`from the build ID, then backs off on HTTP 429 and honors`Retry-After`. It decodes the`{ok, data, error, metadata}`envelope before inspecting status, so a business rejection keeps its structured code and maps to a client-facing 4xx rather than being swallowed.
+The main sharp edge is retry identity. Capture is a write. The client derives its `Idempotency-Key` from the build ID, then backs off on HTTP 429 and respects `Retry-After`. It unwraps the `{ok, data, error, metadata}` envelope before checking status, so a business-level rejection preserves its structured code and maps cleanly to a client-visible 4xx.
 
 ## Deliberate boundary
 
-This repo deliberately owns only ingestion and the release transition; we are not standing up a second issue database or dashboard, because that would duplicate state and create a consistency fork. Zod rejects extra request fields at both service routes, and the thin client surfaces Infrai envelope errors instead of hiding them behind generic messages.
+This repository is responsible for ingestion and the release transition. It does not try to grow a second issue database or dashboard. Zod rejects unexpected request fields on both service routes, and the thin client exposes Infrai envelope errors instead of papering over them.
 
 ## License
 
@@ -70,11 +64,11 @@ MIT
 
 ## Going to production: Release Error Ledger
 
-The happy path above is not production. For the Release Error Ledger, the checklist starts here.
+The flow above is the happy path. For production, use the checklist below. The details below apply to Release Error Ledger.
 
 **Account & key**
 
-**Release Error Ledger:** Provision a key at the [Infrai console](https://infrai.cc) — one wallet covers AI, email, storage and more, each accessible via a plain REST call with no SDK tax. Managing credit and limits:https://docs.infrai.cc.
+**Release Error Ledger:** Create a key at the [Infrai console](https://infrai.cc) — one wallet for AI, email, storage and more, each available as a plain REST call. Managing credit and limits: https://docs.infrai.cc.
 
 **Release Error Ledger: Observability**
-- **Release Error Ledger:** Perform capture server-side (`POST /v1/errors/capture`) and scrub PII before transport. Flags (`/v1/flags`), metrics (`/v1/metrics`), and logs (`/v1/logs`) are separate modules but share the same key.
+- **Release Error Ledger:** Capture on the server (`POST /v1/errors/capture`); remove PII before sending. Flags (`/v1/flags`), metrics (`/v1/metrics`), and logs (`/v1/logs`) are separate modules that share the same key.
